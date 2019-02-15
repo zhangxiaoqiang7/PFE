@@ -104,7 +104,8 @@ def test(cfg, model, distributed):
         )
         synchronize()
 
-
+#export CUDA_VISIBLE_DEVICES=2,3
+#python -m torch.distributed.launch --nproc_per_node=2 ./tools/train_net.py --config-file ./configs/rm_e2e_faster_rcnn_R_50_C4_1x.yaml 
 def main():
     parser = argparse.ArgumentParser(description="PyTorch Object Detection Training")
     parser.add_argument(

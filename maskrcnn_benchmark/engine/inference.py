@@ -5,7 +5,8 @@ import tempfile
 import time
 import os
 from collections import OrderedDict
-
+import numpy as np
+import pdb
 import torch
 
 from tqdm import tqdm
@@ -15,11 +16,22 @@ from ..utils.comm import is_main_process
 from ..utils.comm import scatter_gather
 from ..utils.comm import synchronize
 
-
+from maskrcnn_benchmark.data.datasets.voc_dataset_evaluator import evaluate_boxes
 from maskrcnn_benchmark.modeling.roi_heads.mask_head.inference import Masker
 from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
+from maskrcnn_benchmark.data.datasets.rm_dataset import RMDataset
 
-
+classes = ['c60', 'c70', 'car_people', 'center_ring', 'cross_hatch',
+           'diamond', 'forward_left', 'forward_right', 'forward',
+           'left', 'right', 'u_turn', 'zebra_crossing']
+colors = [(255, 52, 179), (30, 144, 255), (255,106,106), (46, 139, 87), (255, 130, 71),
+          (124, 252, 0), (240, 255, 240), (210,180,140), (255, 0, 0),
+          (255, 255, 0), (160, 32, 240), (135, 38, 87), (0, 139, 139)]
+color_cls = dict()
+for cls, color in zip(classes, colors):
+    # color = (random.randint(0, 256), random.randint(0, 256), random.randint(0, 256))  # generate a random color
+    color_cls[cls] = color[::-1]
+        
 def compute_on_dataset(model, data_loader, device):
     model.eval()
     results_dict = {}
@@ -344,7 +356,80 @@ def check_expected_results(results, expected_results, sigma_tol):
         else:
             msg = "PASS: " + msg
             logger.info(msg)
+   
+def draw_all_detection(im_array, detections, class_names, scale):
+    """
+    visualize all detections in one image
+    :param im_array: [b=1 c h w] in rgb
+    :param detections: [ numpy.ndarray([[x1 y1 x2 y2 score]]) for j in classes ]
+    :param class_names: list of names in imdb
+    :param scale: visualize the scaled image
+    :return:
+    """
+    import cv2
+    import random
+    color_white = (255, 255, 255)
+    #im = image.transform_inverse(im_array, config.PIXEL_MEANS)
+    im = im_array
+    # change to bgr
+    im = cv2.cvtColor(im, cv2.COLOR_RGB2BGR)
+    for j, name in enumerate(class_names):
+        if name == '__background__':
+            continue
 
+        color = color_cls[name]
+        if name in ['c60', 'c70']:
+            name = name[1:]
+        # color = (random.randint(0, 256), random.randint(0, 256), random.randint(0, 256))  # generate a random color
+        dets = detections[j]
+        for det in dets:
+            bbox = det[:4] * scale
+            score = det[-1]
+            bbox = list(map(int, bbox))
+            if score > 0.6:
+                cv2.rectangle(im, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color=color, thickness=3)
+                cv2.putText(im, '%s %.3f' % (name, score), (bbox[0], bbox[1] + 10),
+                            color=color_white, fontFace=cv2.FONT_HERSHEY_COMPLEX, fontScale=0.5)
+    return im
+    
+def prepare_for_voc_eval(predictions, dataset):
+    all_boxes = [[[] for _ in range(len(dataset))]
+                 for _ in range(dataset.num_classes)]
+    for image_id, prediction in enumerate(predictions):
+        img_anno = dataset.anno_lists[image_id]
+        if len(prediction) == 0:
+            continue
+
+        # TODO replace with get_img_info?
+        image_width = img_anno['width']
+        image_height = img_anno['height']
+        
+        prediction = prediction.resize((image_width, image_height))
+        #prediction = prediction.convert("xywh")
+
+        boxes = prediction.bbox.numpy()
+        scores = prediction.get_field("scores").numpy().reshape(-1,1)
+        labels = prediction.get_field("labels").numpy().reshape(-1,1)
+        
+        for jj in range(1, dataset.num_classes):
+            indexes = np.where(labels == jj)[0]
+            #print(indexes)
+            #pdb.set_trace()
+            all_boxes[jj][image_id] = np.concatenate((boxes, scores), axis=-1)[indexes, :]
+    return all_boxes
+    
+def write_vis_results(all_boxes,output_folder):
+    root = '/home/opt48/zhangxq/github/maskrcnn-benchmark/datasets/voc'
+    dataset = RMDataset(root,os.path.join(root,'vocRM_test.pkl'))
+    for img, target, i in dataset:
+        boxes_this_image = [[]] + [all_boxes[j][i] for j in range(1, dataset.num_classes)]
+        im = draw_all_detection(np.array(img), boxes_this_image, dataset.classes, 1)
+        import cv2
+        outdir = os.path.join(output_folder,'test')
+        if not os.path.exists(outdir):
+            os.makedirs(outdir)
+        cv2.imwrite(os.path.join(outdir,str(i) + '.jpg'), im)
+        #pdb.set_trace()
 
 def inference(
     model,
@@ -355,74 +440,85 @@ def inference(
     expected_results=(),
     expected_results_sigma_tol=4,
     output_folder=None,
+    vis=True,
 ):
 
-    # convert to a torch.device for efficiency
-    device = torch.device(device)
-    num_devices = (
-        torch.distributed.deprecated.get_world_size()
-        if torch.distributed.deprecated.is_initialized()
-        else 1
-    )
     logger = logging.getLogger("maskrcnn_benchmark.inference")
     dataset = data_loader.dataset
     logger.info("Start evaluation on {} images".format(len(dataset)))
-    start_time = time.time()
-    predictions = compute_on_dataset(model, data_loader, device)
-    # wait for all processes to complete before measuring the time
-    synchronize()
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=total_time))
-    logger.info(
-        "Total inference time: {} ({} s / img per device, on {} devices)".format(
-            total_time_str, total_time * num_devices / len(dataset), num_devices
+    pred_cache = os.path.join(output_folder, "predictions.pth")
+    if os.path.exists(pred_cache):
+        predictions = torch.load(pred_cache)
+    else:
+        # convert to a torch.device for efficiency
+        device = torch.device(device)
+        num_devices = (
+            torch.distributed.deprecated.get_world_size()
+            if torch.distributed.deprecated.is_initialized()
+            else 1
         )
-    )
-
-    predictions = _accumulate_predictions_from_multiple_gpus(predictions)
-    if not is_main_process():
-        return
-
-    if output_folder:
-        torch.save(predictions, os.path.join(output_folder, "predictions.pth"))
-
-    if box_only:
-        logger.info("Evaluating bbox proposals")
-        areas = {"all": "", "small": "s", "medium": "m", "large": "l"}
-        res = COCOResults("box_proposal")
-        for limit in [100, 1000]:
-            for area, suffix in areas.items():
-                stats = evaluate_box_proposals(
-                    predictions, dataset, area=area, limit=limit
-                )
-                key = "AR{}@{:d}".format(suffix, limit)
-                res.results["box_proposal"][key] = stats["ar"].item()
-        logger.info(res)
-        check_expected_results(res, expected_results, expected_results_sigma_tol)
-        if output_folder:
-            torch.save(res, os.path.join(output_folder, "box_proposals.pth"))
-        return
-    logger.info("Preparing results for COCO format")
-    coco_results = {}
-    if "bbox" in iou_types:
-        logger.info("Preparing bbox results")
-        coco_results["bbox"] = prepare_for_coco_detection(predictions, dataset)
-    if "segm" in iou_types:
-        logger.info("Preparing segm results")
-        coco_results["segm"] = prepare_for_coco_segmentation(predictions, dataset)
-
-    results = COCOResults(*iou_types)
-    logger.info("Evaluating predictions")
-    for iou_type in iou_types:
-        with tempfile.NamedTemporaryFile() as f:
-            file_path = f.name
-            if output_folder:
-                file_path = os.path.join(output_folder, iou_type + ".json")
-            res = evaluate_predictions_on_coco(
-                dataset.coco, coco_results[iou_type], file_path, iou_type
+        start_time = time.time()
+        predictions = compute_on_dataset(model, data_loader, device)
+        # wait for all processes to complete before measuring the time
+        synchronize()
+        total_time = time.time() - start_time
+        total_time_str = str(datetime.timedelta(seconds=total_time))
+        logger.info(
+            "Total inference time: {} ({} s / img per device, on {} devices)".format(
+                total_time_str, total_time * num_devices / len(dataset), num_devices
             )
-            results.update(res)
-    logger.info(results)
-    check_expected_results(results, expected_results, expected_results_sigma_tol)
-    if output_folder:
-        torch.save(results, os.path.join(output_folder, "coco_results.pth"))
+        )
+
+        predictions = _accumulate_predictions_from_multiple_gpus(predictions)
+        if not is_main_process():
+            return
+
+        if output_folder:
+            torch.save(predictions, pred_cache)
+    
+    all_boxes = prepare_for_voc_eval(predictions, dataset)
+    #pdb.set_trace()
+    if vis:
+        write_vis_results(all_boxes,output_folder)
+    evaluate_boxes(dataset,all_boxes,output_folder)
+
+#    if box_only:
+#        logger.info("Evaluating bbox proposals")
+#        areas = {"all": "", "small": "s", "medium": "m", "large": "l"}
+#        res = COCOResults("box_proposal")
+#        for limit in [100, 1000]:
+#            for area, suffix in areas.items():
+#                stats = evaluate_box_proposals(
+#                    predictions, dataset, area=area, limit=limit
+#                )
+#                key = "AR{}@{:d}".format(suffix, limit)
+#                res.results["box_proposal"][key] = stats["ar"].item()
+#        logger.info(res)
+#        check_expected_results(res, expected_results, expected_results_sigma_tol)
+#        if output_folder:
+#            torch.save(res, os.path.join(output_folder, "box_proposals.pth"))
+#        return
+#    logger.info("Preparing results for COCO format")
+#    coco_results = {}
+#    if "bbox" in iou_types:
+#        logger.info("Preparing bbox results")
+#        coco_results["bbox"] = prepare_for_coco_detection(predictions, dataset)
+#    if "segm" in iou_types:
+#        logger.info("Preparing segm results")
+#        coco_results["segm"] = prepare_for_coco_segmentation(predictions, dataset)
+#
+#    results = COCOResults(*iou_types)
+#    logger.info("Evaluating predictions")
+#    for iou_type in iou_types:
+#        with tempfile.NamedTemporaryFile() as f:
+#            file_path = f.name
+#            if output_folder:
+#                file_path = os.path.join(output_folder, iou_type + ".json")
+#            res = evaluate_predictions_on_coco(
+#                dataset.coco, coco_results[iou_type], file_path, iou_type
+#            )
+#            results.update(res)
+#    logger.info(results)
+#    check_expected_results(results, expected_results, expected_results_sigma_tol)
+#    if output_folder:
+#        torch.save(results, os.path.join(output_folder, "coco_results.pth"))

@@ -21,6 +21,14 @@ class DatasetCatalog(object):
             "coco/val2014",
             "coco/annotations/instances_valminusminival2014.json",
         ),
+        'voc_rm_train':(
+            'voc',
+            'voc/vocRM_train.pkl',
+        ),
+        'voc_rm_test':(
+            'voc',
+            'voc/vocRM_test.pkl',
+        ),
     }
 
     @staticmethod
@@ -34,6 +42,17 @@ class DatasetCatalog(object):
             )
             return dict(
                 factory="COCODataset",
+                args=args,
+            )
+        elif 'voc' in name:
+            data_dir = DatasetCatalog.DATA_DIR
+            attrs = DatasetCatalog.DATASETS[name]
+            args = dict(
+                root=os.path.join(data_dir, attrs[0]),
+                ann_file=os.path.join(data_dir, attrs[1]),
+            )
+            return dict(
+                factory="RMDataset",
                 args=args,
             )
         raise RuntimeError("Dataset not available: {}".format(name))

@@ -50,7 +50,7 @@ _C.INPUT.PIXEL_MEAN = [102.9801, 115.9465, 122.7717]
 _C.INPUT.PIXEL_STD = [1., 1., 1.]
 # Convert image to BGR format (for Caffe2 models), in range 0-255
 _C.INPUT.TO_BGR255 = True
-
+_C.INPUT.FLIP_PROB_TRAIN = 0.5
 
 # -----------------------------------------------------------------------------
 # Dataset
@@ -90,7 +90,15 @@ _C.MODEL.BACKBONE.CONV_BODY = "R-50-C4"
 _C.MODEL.BACKBONE.FREEZE_CONV_BODY_AT = 2
 _C.MODEL.BACKBONE.OUT_CHANNELS = 256 * 4
 
-
+# ---------------------------------------------------------------------------- #
+# Transformers options
+# ---------------------------------------------------------------------------- #
+_C.MODEL.TRANSFORMER = CN()
+_C.MODEL.TRANSFORMER.USE_TRANS = False
+_C.MODEL.TRANSFORMER.TYPE = "PSP"
+_C.MODEL.TRANSFORMER.POOL_SIZES = [6,3,2,1]
+_C.MODEL.TRANSFORMER.KERNEL_SIZES = [1,2,4,8]
+_C.MODEL.TRANSFORMER.RATES = [1,6,12,18]
 # ---------------------------------------------------------------------------- #
 # RPN options
 # ---------------------------------------------------------------------------- #
